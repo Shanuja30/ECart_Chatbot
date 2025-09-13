@@ -1,121 +1,136 @@
-import os
-from dotenv import load_dotenv
-from fastapi import FastAPI
+# app.py
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_groq import ChatGroq
+import os
+from dotenv import load_dotenv
 
-# -----------------------------
 # Load environment variables
-# -----------------------------
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
-if not groq_api_key:
-    raise ValueError("Please set GROQ_API_KEY in your .env file!")
 
-# -----------------------------
-# Initialize FastAPI
-# -----------------------------
-app = FastAPI(title="EcoCart AI Chatbot")
+# LangChain imports
+from langchain_groq import ChatGroq
+from langchain_community.document_loaders import PyPDFLoader  # updated import
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain_core.messages import HumanMessage, AIMessage
 
-# Allow frontend CORS (React frontend on port 3000)
-origins = ["http://localhost:3000"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-# -----------------------------
-# Load PDF and create vector DB
-# -----------------------------
-pdf_file = "EcoCart_Online.pdf"
-if not os.path.exists(pdf_file):
-    raise FileNotFoundError(f"❌ PDF file not found: {pdf_file}")
-
-loader = PyPDFLoader(pdf_file)
-pages = loader.load()
-
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-docs = text_splitter.split_documents(pages)
-
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vectordb = Chroma.from_documents(
-    documents=docs,
-    embedding=embeddings,
-    persist_directory="./chroma_ecocart"
-)
-
-print(f"✅ PDF loaded ({len(pages)} pages) and Vector DB ready ({len(docs)} chunks).")
-
-# -----------------------------
-# Initialize ChatGroq LLM
-# -----------------------------
+# -------------------------
+# Load LLM
+# -------------------------
 llm = ChatGroq(
     groq_api_key=groq_api_key,
-    model_name="llama-3.3-70b-versatile",
+    model_name="llama-3.1-8b-instant",
     temperature=0.7
 )
 
-# -----------------------------
-# Conversation memory
-# -----------------------------
-conversation_history = []  # Store recent messages
+# -------------------------
+# Load EcoCart PDF
+# -------------------------
+pdf_files = [r"./EcoCart_Online.pdf"]  # Correct PDF name
+all_docs = []
 
-# -----------------------------
-# Pydantic model for request
-# -----------------------------
+for file in pdf_files:
+    loader = PyPDFLoader(file)
+    docs = loader.load()
+    all_docs.extend(docs)
+
+# Split into chunks
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+splits = text_splitter.split_documents(all_docs)
+
+# Create embeddings & vector store
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vector_store = Chroma.from_documents(splits, embeddings)
+retriever = vector_store.as_retriever()
+
+# -------------------------
+# Prompts with formatting instructions
+# -------------------------
+system_prompt = """
+You are EcoCart Assistant. Use the following context to answer questions about EcoCart Online policies. 
+Be concise, friendly, and helpful. Format your answers in:
+- Short paragraphs
+- Numbered lists or bullet points when appropriate
+- Headers if needed
+- Line breaks for readability
+
+Context:
+{context}
+"""
+
+human_prompt = "{input}"
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    ("human", human_prompt)
+])
+
+qa_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+# History-aware retriever
+contextual_q_system_prompt = """
+Given a chat history and the latest user question, 
+formulate a standalone question understandable without history.
+Do not answer, just reformulate.
+"""
+contextual_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", contextual_q_system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}")
+])
+
+history_aware_retriever = create_history_aware_retriever(llm, retriever, contextual_q_prompt)
+rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+
+# -------------------------
+# FastAPI setup
+# -------------------------
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class ChatRequest(BaseModel):
-    user_input: str
+    message: str
+    user_id: str = "default"
 
-# -----------------------------
-# API endpoint
-# -----------------------------
+chat_histories = {}
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    user_input = request.user_input.strip()
-
-    # Retrieve relevant chunks from Chroma
-    results = vectordb.similarity_search(user_input, k=3)
-    context = "\n".join([r.page_content for r in results])
-
-    # Build prompt including conversation history
-    history_text = "\n".join(conversation_history[-6:])  # last 6 messages
-    user_message = f"""You are EcoCart AI, a helpful assistant.
-Answer briefly, clearly, and in a friendly tone.
-- Use bullet points or 2–3 short sentences.
-- Do NOT hallucinate—if unknown, say you don't know.
-
-Conversation history:
-{history_text}
-
-Context from documents:
-{context}
-
-User question:
-{user_input}"""
-
     try:
-        response = llm.invoke(user_message)
-        answer = response.content if hasattr(response, "content") else str(response)
+        user_id = request.user_id
+        if user_id not in chat_histories:
+            chat_histories[user_id] = []
 
-        # Update conversation history
-        conversation_history.append(f"User: {user_input}")
-        conversation_history.append(f"AI: {answer}")
+        chat_history = chat_histories[user_id]
 
-        return {"response": answer}
+        response = rag_chain.invoke({
+            "input": request.message,
+            "chat_history": chat_history
+        })
 
+        # Store chat history
+        chat_history.append(HumanMessage(content=request.message))
+        chat_history.append(AIMessage(content=response['answer']))
+
+        # Return answer as text
+        return {"response": response['answer']}
     except Exception as e:
-        return {"response": f"❌ Error generating response: {e}"}
+        raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------
-# Health check endpoint
-# -----------------------------
-@app.get("/")
-async def root():
-    return {"message": "EcoCart AI Chatbot is running 🚀. Use POST /chat to interact."}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
