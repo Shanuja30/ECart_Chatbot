@@ -32,7 +32,8 @@ This project features an **AI-powered chatbot** that provides instant customer s
 5. Add your API keys or environment variables in a .env file.
    Usage
    Run the backend server:
-   python -m uvicorn app:app --reload
+   python -m uvicorn app:app --reload --port 8001
+
    Run the frontend (React.js):
    npm install
    npm start

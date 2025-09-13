@@ -27,15 +27,18 @@ const Chatbot = () => {
     setLoading(true);
 
     try {
-      const response = await fetch("http://localhost:8001/ask", {
+      const response = await fetch("http://localhost:8001/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: userMessage }),
+        body: JSON.stringify({ user_input: userMessage }),
       });
+
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
       const data = await response.json();
       const aiEntry = {
         sender: "ai",
-        text: data.answer,
+        text: data.response, // Match backend response key
         time: dayjs().format("HH:mm"),
       };
       setChat((prev) => [...prev, aiEntry]);
@@ -125,17 +128,10 @@ const Chatbot = () => {
                 wordBreak: "break-word",
               }}
             >
-              {/* Preserve line breaks and bullets */}
-              <Typography 
-                variant="body2" 
-                sx={{ whiteSpace: "pre-line" }}
-              >
+              <Typography variant="body2" sx={{ whiteSpace: "pre-line" }}>
                 {msg.text}
               </Typography>
-              <Typography
-                variant="caption"
-                sx={{ display: "block", textAlign: "right", mt: 0.5 }}
-              >
+              <Typography variant="caption" sx={{ display: "block", textAlign: "right", mt: 0.5 }}>
                 {msg.time}
               </Typography>
             </Paper>
@@ -152,7 +148,7 @@ const Chatbot = () => {
             placeholder="Type your question..."
             value={userMessage}
             onChange={(e) => setUserMessage(e.target.value)}
-            onKeyPress={handleKeyPress}
+            onKeyDown={handleKeyPress} // updated
           />
           <IconButton color="primary" onClick={handleSend} sx={{ ml: 1 }}>
             <SendIcon />
